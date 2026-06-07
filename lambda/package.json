@@ -1,0 +1,15 @@
+{
+  "name": "lambda-streaming-handler",
+  "version": "1.0.0",
+  "description": "AWS Lambda response streaming handler — SSE token example",
+  "type": "module",
+  "main": "src/index.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "zip -j ../lambda.zip src/index.mjs",
+    "test": "node --experimental-vm-modules src/index.mjs"
+  },
+  "license": "MIT"
+}
