@@ -24,7 +24,7 @@ RED='\033[0;31m'
 BLUE='\033[0;34m'
 
 # ── Config ────────────────────────────────────────────────────────
-URL="${STREAM_URL:'https://eer1iukae7.execute-api.us-east-1.amazonaws.com/dev/stream'}"
+URL="${STREAM_URL:-}"
 CONNECT_TIMEOUT=10
 MAX_TIME=120       # max seconds to wait for a full response
 
@@ -83,26 +83,42 @@ stream_response() {
     # or end signal:        data: {"done":true}
     # or error:             data: {"error":"..."}
 
+    # Normalise: strip "data: " prefix if present, skip blank/comment lines
+    local json=""
     if [[ "$line" == data:* ]]; then
-      local json="${line#data: }"
+      json="${line#data: }"        # SSE framed:  data: {"token":"..."}
+    elif [[ "$line" == "{"* ]]; then
+      json="$line"                 # bare JSON:   {"token":"..."}  (LWA strips framing)
+    else
+      continue                     # blank line, SSE comment, etc.
+    fi
 
-      # Check for done signal
-      if echo "$json" | grep -q '"done":true'; then
-        got_done=true
-        break
-      fi
+    [[ -z "$json" ]] && continue
 
-      # Check for error
-      if echo "$json" | grep -q '"error"'; then
-        error_msg=$(echo "$json" | sed 's/.*"error":"\([^"]*\)".*/\1/')
-        break
-      fi
+    # Check for done signal
+    if echo "$json" | grep -q '"done"'; then
+      got_done=true
+      break
+    fi
 
-      # Extract token value (handles spaces and special chars)
-      local token
-      token=$(echo "$json" | sed 's/.*"token":"\(.*\)".*/\1/')
+    # Check for error
+    if echo "$json" | grep -q '"error"'; then
+      error_msg=$(echo "$json" | sed 's/.*"error":"\([^"]*\)".*/\1/')
+      break
+    fi
 
-      # Print token inline without newline
+    # Extract token using python3 for reliable JSON parsing
+    local token
+    token=$(echo "$json" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('token',''), end='')
+except:
+    pass
+")
+
+    if [[ -n "$token" ]]; then
       printf "%s" "$token"
       token_count=$((token_count + 1))
     fi

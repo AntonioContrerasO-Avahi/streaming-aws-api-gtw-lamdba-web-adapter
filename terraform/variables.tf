@@ -17,17 +17,13 @@ variable "environment" {
 }
 
 variable "lambda_memory_mb" {
-  description = "Lambda memory in MB (128–10240)"
+  description = "Lambda memory in MB (512 MB minimum recommended for Docker images)"
   type        = number
   default     = 512
 }
 
 variable "lambda_timeout_seconds" {
-  description = <<-EOT
-    Lambda execution timeout in seconds.
-    For streaming / LLM workloads raise this to 300–900.
-    API Gateway integration timeout is set to match (up to 900 s).
-  EOT
+  description = "Lambda execution timeout in seconds. Raise to 300–900 for real LLM calls."
   type        = number
   default     = 60
 }

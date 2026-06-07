@@ -6,7 +6,6 @@ data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
     effect  = "Allow"
     actions = ["sts:AssumeRole"]
-
     principals {
       type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
@@ -19,16 +18,21 @@ resource "aws_iam_role" "lambda_exec" {
   assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
 }
 
-# Basic execution: write logs to CloudWatch
+# Write logs to CloudWatch
 resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
   role       = aws_iam_role.lambda_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-# ── Optional: add more managed policies below ──────────────────────────────
-# e.g. Bedrock access if you replace the token generator with a real LLM call:
+# Pull images from ECR
+resource "aws_iam_role_policy_attachment" "lambda_ecr_readonly" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+# ── Uncomment when swapping fake_stream() for real Bedrock ───────────────────
 #
-# resource "aws_iam_role_policy_attachment" "bedrock" {
+# resource "aws_iam_role_policy_attachment" "lambda_bedrock" {
 #   role       = aws_iam_role.lambda_exec.name
 #   policy_arn = "arn:aws:iam::aws:policy/AmazonBedrockFullAccess"
 # }

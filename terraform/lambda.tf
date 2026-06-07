@@ -1,15 +1,5 @@
 # ─────────────────────────────────────────────
-#  Package Lambda source → zip
-# ─────────────────────────────────────────────
-
-data "archive_file" "lambda_zip" {
-  type        = "zip"
-  source_dir  = "${path.module}/../lambda/src"
-  output_path = "${path.module}/../lambda/lambda.zip"
-}
-
-# ─────────────────────────────────────────────
-#  CloudWatch log group (explicit, for retention)
+#  CloudWatch log group
 # ─────────────────────────────────────────────
 
 resource "aws_cloudwatch_log_group" "lambda_logs" {
@@ -18,20 +8,21 @@ resource "aws_cloudwatch_log_group" "lambda_logs" {
 }
 
 # ─────────────────────────────────────────────
-#  Lambda function
+#  Lambda function — Docker image packaging
+#
+#  Key differences vs zip-based Lambda:
+#    • package_type = "Image"          (not Zip)
+#    • image_uri    = ECR image URL    (not filename/handler/runtime)
+#    • No handler or runtime fields
 # ─────────────────────────────────────────────
 
 resource "aws_lambda_function" "streaming" {
   function_name = "${var.project_name}-${var.environment}"
-  description   = "Streaming token response demo — SSE via API Gateway REST"
+  description   = "FastAPI streaming via Lambda Web Adapter + Docker"
 
-  # Packaging
-  filename         = data.archive_file.lambda_zip.output_path
-  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
-
-  # Runtime — Node 22 supports ESM + awslambda.streamifyResponse natively
-  runtime = "nodejs22.x"
-  handler = "index.handler"
+  # Docker image packaging
+  package_type = "Image"
+  image_uri    = docker_registry_image.app.name
 
   # Resources
   memory_size = var.lambda_memory_mb
@@ -39,6 +30,16 @@ resource "aws_lambda_function" "streaming" {
 
   # Execution role
   role = aws_iam_role.lambda_exec.arn
+
+  environment {
+    variables = {
+      # Lambda Web Adapter reads these at startup (already baked into image,
+      # but explicit here makes them visible in Terraform state)
+      AWS_LWA_INVOKE_MODE          = "RESPONSE_STREAM"
+      AWS_LWA_READINESS_CHECK_PATH = "/health"
+      PORT                         = "8080"
+    }
+  }
 
   # CloudWatch logging
   logging_config {
@@ -48,13 +49,14 @@ resource "aws_lambda_function" "streaming" {
 
   depends_on = [
     aws_iam_role_policy_attachment.lambda_basic_execution,
+    aws_iam_role_policy_attachment.lambda_ecr_readonly,
     aws_cloudwatch_log_group.lambda_logs,
+    docker_registry_image.app,   # image must exist in ECR before Lambda is created
   ]
 }
 
 # ─────────────────────────────────────────────
-#  Permission — allow API Gateway to invoke Lambda
-#  (uses InvokeWithResponseStream action under the hood)
+#  Permission — API Gateway → Lambda
 # ─────────────────────────────────────────────
 
 resource "aws_lambda_permission" "apigw_invoke" {
@@ -62,7 +64,5 @@ resource "aws_lambda_permission" "apigw_invoke" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.streaming.function_name
   principal     = "apigateway.amazonaws.com"
-
-  # Restrict to this specific REST API
-  source_arn = "${aws_api_gateway_rest_api.api.execution_arn}/*/*"
+  source_arn    = "${aws_api_gateway_rest_api.api.execution_arn}/*/*"
 }
