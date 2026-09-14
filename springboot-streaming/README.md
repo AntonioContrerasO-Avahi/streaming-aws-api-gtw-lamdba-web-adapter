@@ -1,109 +1,190 @@
-# Spring Boot 2 example
+# springboot-streaming
 
-A basic pet store application written with the Spring Boot 2 framework. You can build and test it locally as a typical Spring Boot 2 application.
+Spring Boot 3.5 / Java 25 application that streams flight search results over **Server-Sent Events (SSE)** using the [AWS Lambda Web Adapter](https://github.com/awslabs/aws-lambda-web-adapter) pattern. Deployable as a Docker-based Lambda function or run locally as a standard container.
 
-Using AWS Lambda Adapter, you can package this web application into Docker image, push to ECR, and deploy to Lambda, ECS/EKS, or EC2.
+---
 
-The application can be deployed in an AWS account using the [Serverless Application Model](https://github.com/aws/serverless-application-model). The `template.yaml` file in the root folder contains the application definition.
+## What was built
 
-The top level folder is a typical AWS SAM project. The `app` directory is a Spring Boot application with a multi-stage [Dockerfile](app/Dockerfile).
+### Problem
+Traditional REST APIs return all results in one blocking response. When multiple upstream providers have different response times (5 s, 10 s, 30 s…), the user waits for the slowest one before seeing anything.
+
+### Solution
+A single persistent SSE connection streams each provider's results the moment they are ready. When AI ranking is enabled, the backend holds each flight record until its score is computed, then sends one combined event — the client never renders an unscored result.
+
+```
+Client ──── GET /search/stream?ai=true ────► Spring Boot
+            ◄── data: meta (12 flights expected)
+            ◄── data: JetBlue-0 {flight + score: 89}    (+6.5 s)
+            ◄── data: JetBlue-1 {flight + score: 72}    (+7.1 s)
+            ◄── data: JetBlue-2 {flight + score: 58}    (+7.8 s)
+            ◄── data: Delta-0   {flight + score: 94}    (+11.6 s)
+            ...
+            ◄── data: [DONE]                            (+33 s)
+```
+
+### Key implementation decisions
+
+| Decision | Why |
+|---|---|
+| **Hold flight until scored** | Client sees only ready-to-display records; no "Scoring…" loading state needed |
+| **`CorsFilter` bean (Servlet-level)** | `@CrossOrigin` on the method is applied after the response commits — too late for streaming. A filter runs before any bytes are written |
+| **`EventSource` in the browser** | Native SSE API; handles buffering and the SSE framing protocol correctly. `fetch()+ReadableStream` is fragile across origins |
+| **FLIP animation** | When a new scored card ranks higher than existing ones, all cards physically slide to their new positions using the browser's GPU layer (`will-change: transform`) |
+| **Deterministic `seededScore()`** | Same seed → same scores on every run, so demos are reproducible. Port of the original Node.js hash |
+
+---
+
+## Project structure
+
+```
+springboot-streaming/
+├── Dockerfile                          # Multi-stage build: Eclipse Temurin 25 → JRE 25 + Lambda Adapter
+├── pom.xml                             # Spring Boot 3.5.4, Java 25
+├── test-local.sh                       # Terminal test script
+└── src/main/
+    ├── java/com/amazonaws/demo/
+    │   ├── Application.java            # Boot entry point + global CorsFilter bean
+    │   └── controller/
+    │       └── SearchController.java   # SSE endpoint, provider data, scoring logic
+    └── resources/
+        ├── application.properties      # banner off, async timeout 65 s
+        ├── logback.xml
+        └── static/index.html           # Minimal "API only" page (UI lives in scripts/)
+```
+
+The standalone UI lives at `../scripts/flight-search.html` — it is intentionally outside this folder so it is not baked into the Docker image.
+
+---
+
+## Endpoint
+
+```
+GET /search/stream?ai=false&seed=0
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ai` | `false` | When `true`, backend scores each flight before emitting it |
+| `seed` | `0` | Integer seed for deterministic score generation (0–99 999) |
+
+### Event types
+
+```jsonc
+// Always sent first
+{ "type": "meta", "totalFlights": 12 }
+
+// One per flight (score field present only when ai=true)
+{ "type": "flight", "flightId": "Delta-0", "airline": "Delta", "code": "DL",
+  "from": "JFK", "to": "LAX", "departure": "06:00 AM", "arrival": "09:32 AM",
+  "duration": "5h 32m", "stops": 0, "price": "C$534",
+  "providerResponseTime": 10000, "score": 94 }
+
+// Stream end marker
+[DONE]
+```
+
+### Provider schedule
+
+| Airline | Response delay | Flights |
+|---|---|---|
+| JetBlue | 5 s | 3 |
+| Delta | 10 s | 3 |
+| United | 15 s | 2 |
+| American | 22 s | 2 |
+| Air China | 30 s | 2 |
+
+With `ai=true` each flight is held an additional 1.5–3 s for scoring before being sent.
+
+---
+
+## Run locally
+
+### Prerequisites
+- Docker
+- Python 3 (for the browser UI)
+
+### 1 — Build
+
+```bash
+cd springboot-streaming
+docker build -t springboot-streaming .
+```
+
+> First build downloads Eclipse Temurin 25 + Maven dependencies (~5 min). Subsequent builds use the layer cache and take ~30 s.
+
+### 2 — Run
+
+```bash
+docker run --rm -p 8000:8000 springboot-streaming
+```
+
+Health check:
+```bash
+curl http://localhost:8000/healthz
+# → healthy
+```
+
+---
+
+## Test locally
+
+### Option A — Terminal (no browser needed)
+
+```bash
+# Flights only — providers respond at 5 s, 10 s, 15 s, 22 s, 30 s
+./test-local.sh
+
+# With AI ranking — same delays + 1.5-3 s scoring hold per flight
+./test-local.sh --ai
+```
+
+Expected output with `--ai`:
+
+```
+  Endpoint : http://localhost:8000/search/stream?ai=true&seed=42
+  Mode     : AI on — backend holds each flight until scored, then streams
+─────────────────────────────────────────────────────────────────────────
+[+ 0.0s]  ℹ  Expecting 12 flights
+
+[+ 6.8s]  ✈  JetBlue      JFK → LAX  08:15 AM   → 11:28 AM   5h 13m   nonstop       C$489  ★ 89
+              top: JetBlue(89)
+[+ 7.3s]  ✈  JetBlue      JFK → LAX  01:00 PM   → 04:19 PM   5h 19m   nonstop       C$521  ★ 72
+              top: JetBlue(89)  >  JetBlue(72)
+...
+[+11.8s]  ✈  Delta        JFK → LAX  06:00 AM   → 09:32 AM   5h 32m   nonstop       C$534  ★ 94
+              top: Delta(94)  >  JetBlue(89)  >  JetBlue(72)
+...
+[+33.2s]  ✓  Stream complete
+```
+
+### Option B — Browser UI
+
+The UI in `scripts/flight-search.html` uses `EventSource` (native SSE) and must be served over HTTP — opening it as `file://` is blocked by Chrome's CORS policy for localhost fetches.
+
+```bash
+# From the repo root (not inside springboot-streaming/)
+python3 -m http.server 3000 --directory scripts/
+```
+
+Then open **http://localhost:3000/flight-search.html**.
+
+Click **Search Flights**, toggle **AI Ranking** on, and watch:
+1. Cards arrive progressively as providers respond
+2. Each card shows its AI score badge (★ 94) the moment it appears
+3. When a higher-scored card arrives, all existing cards FLIP-animate to their new positions
+4. The **"Better deal found"** banner slides in above the new top result
+
+---
+
+## AWS deployment
+
+The `Dockerfile` includes the Lambda Web Adapter sidecar:
 
 ```dockerfile
-FROM public.ecr.aws/sam/build-java8.al2:latest as build-image
-WORKDIR "/task"
-COPY src src/
-COPY pom.xml ./
-RUN mvn -q clean package
-
-FROM public.ecr.aws/docker/library/amazoncorretto:8u322-al2
-COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.0.1 /lambda-adapter /opt/extensions/lambda-adapter
-ENV PORT=8000
-WORKDIR /opt
-COPY --from=build-image /task/target/petstore-0.0.1-SNAPSHOT.jar /opt
-CMD ["java", "-jar", "petstore-0.0.1-SNAPSHOT.jar", "--server.port=${PORT}"]
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4 \
+     /lambda-adapter /opt/extensions/lambda-adapter
+ENV AWS_LWA_INVOKE_MODE=response_stream
 ```
 
-Line 7 copies lambda adapter binary to /opt/extensions. This is the only change to run the Spring Boot application on Lambda.
-
-```dockerfile
-COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.0.1 /lambda-adapter /opt/extensions/lambda-adapter
-```
-
-## Remove the base path
-
-The pet store application is deployed under /v1/{proxy+}. But the application does not know that. So in the SAM template file, we configured environment variable `REMOVE_BASE_PATH=/v1`.
-This configuration tells the Adapter to remove `/v1` from http request path, so that the pet store application works without changing code.
-
-## Pre-requisites
-
-The following tools should be installed and configured.
-
-* [AWS CLI](https://aws.amazon.com/cli/)
-* [SAM CLI](https://github.com/aws/aws-sam-cli)
-* [Maven](https://maven.apache.org/)
-* [Docker](https://www.docker.com/products/docker-desktop)
-
-## Deploy to Lambda
-
-Navigate to the sample's folder and use the SAM CLI to build a container image
-
-```shell
-aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
-sam build
-```
-
-This command compiles the application and prepares a deployment package in the `.aws-sam` sub-directory.
-
-To deploy the application in your AWS account, you can use the SAM CLI's guided deployment process and follow the instructions on the screen
-
-```shell
-sam deploy --guided
-```
-
-Please take note of the container image name.
-Once the deployment is completed, the SAM CLI will print out the stack's outputs, including the new application URL. You can use `curl` or a web browser to make a call to the URL
-
-```shell
-...
----------------------------------------------------------------------------------------------------------
-OutputKey-Description                        OutputValue
----------------------------------------------------------------------------------------------------------
-PetStoreApi - URL for application            https://xxxxxxxxxx.execute-api.us-west-2.amazonaws.com/v1/pets
----------------------------------------------------------------------------------------------------------
-...
-
-curl https://xxxxxxxxxx.execute-api.us-west-2.amazonaws.com/v1/pets
-```
-
-## Run the docker locally
-
-You can run the same docker image locally, so that we know it can be deployed to ECS Fargate and EKS EC2 without code changes.
-
-```shell
-docker run -d -p 8000:8000 {ECR Image}
-
-```
-
-Use curl to verify the docker container works.
-
-```shell
-curl localhost:8000/pets
-```
-
-## Local test with SAM CLI
-
-In general, you can test your web app locally without simulating AWS Lambda execution environment. But if you want to simulate Lambda and API Gateway locally, you can use SAM CLI. 
-
-```shell
-sam local start-api --warm-containers EAGER
-```
-
-This command will start a local http endpoint and docker container to simulate API Gateway and Lambda. You can test it using `curl`, `postman`, and web browser. 
-
-## Clean up
-
-This example use provisioned concurrency to reduce cold start time. It incurs additional cost. You can remove the whole example with the following command.
-
-```shell
-sam delete
-```
+This lets the function URL stream the SSE response directly to the caller without buffering. Wire it up with Terraform (see `../terraform/`) using a Lambda Function URL with `InvokeMode: RESPONSE_STREAM`.
