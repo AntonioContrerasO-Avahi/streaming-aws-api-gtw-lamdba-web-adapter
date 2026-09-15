@@ -8,7 +8,7 @@ RUN mvn -q clean package -DskipTests
 
 FROM eclipse-temurin:25-jre
 # Lambda Web Adapter — translates HTTP <-> Lambda invocation protocol when deployed to AWS
-COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4 /lambda-adapter /opt/extensions/lambda-adapter
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.0.1 /lambda-adapter /opt/extensions/lambda-adapter
 ENV PORT=8000
 ENV AWS_LWA_INVOKE_MODE=response_stream
 WORKDIR /opt

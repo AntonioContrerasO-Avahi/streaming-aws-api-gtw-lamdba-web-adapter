@@ -1,4 +1,4 @@
-# springboot-streaming
+# java-streaming
 
 Spring Boot 3.5 / Java 25 application that streams flight search results over **Server-Sent Events (SSE)** using the [AWS Lambda Web Adapter](https://github.com/awslabs/aws-lambda-web-adapter) pattern. Deployable as a Docker-based Lambda function or run locally as a standard container.
 
@@ -28,7 +28,7 @@ Client ──── GET /search/stream?ai=true ────► Spring Boot
 | Decision | Why |
 |---|---|
 | **Hold flight until scored** | Client sees only ready-to-display records; no "Scoring…" loading state needed |
-| **`CorsFilter` bean (Servlet-level)** | `@CrossOrigin` on the method is applied after the response commits — too late for streaming. A filter runs before any bytes are written |
+| **Plain `jakarta.servlet.Filter` for CORS** | Spring's `CorsFilter` injects a multi-value `Vary` header that violates the API Gateway streaming prelude schema. A raw servlet filter sets `Access-Control-Allow-*` headers directly without triggering `Vary` injection |
 | **`EventSource` in the browser** | Native SSE API; handles buffering and the SSE framing protocol correctly. `fetch()+ReadableStream` is fragile across origins |
 | **FLIP animation** | When a new scored card ranks higher than existing ones, all cards physically slide to their new positions using the browser's GPU layer (`will-change: transform`) |
 | **Deterministic `seededScore()`** | Same seed → same scores on every run, so demos are reproducible. Port of the original Node.js hash |
@@ -38,13 +38,14 @@ Client ──── GET /search/stream?ai=true ────► Spring Boot
 ## Project structure
 
 ```
-springboot-streaming/
+java-streaming/
 ├── Dockerfile                          # Multi-stage build: Eclipse Temurin 25 → JRE 25 + Lambda Adapter
 ├── pom.xml                             # Spring Boot 3.5.4, Java 25
 ├── test-local.sh                       # Terminal test script
+├── terraform/                          # OpenTofu — ECR, Lambda, API Gateway
 └── src/main/
     ├── java/com/amazonaws/demo/
-    │   ├── Application.java            # Boot entry point + global CorsFilter bean
+    │   ├── Application.java            # Boot entry point + plain servlet CORS filter
     │   └── controller/
     │       └── SearchController.java   # SSE endpoint, provider data, scoring logic
     └── resources/
@@ -107,8 +108,8 @@ With `ai=true` each flight is held an additional 1.5–3 s for scoring before be
 ### 1 — Build
 
 ```bash
-cd springboot-streaming
-docker build -t springboot-streaming .
+cd java-streaming
+docker build -t java-streaming .
 ```
 
 > First build downloads Eclipse Temurin 25 + Maven dependencies (~5 min). Subsequent builds use the layer cache and take ~30 s.
@@ -116,7 +117,7 @@ docker build -t springboot-streaming .
 ### 2 — Run
 
 ```bash
-docker run --rm -p 8000:8000 springboot-streaming
+docker run --rm -p 8000:8000 java-streaming
 ```
 
 Health check:
@@ -179,12 +180,51 @@ Click **Search Flights**, toggle **AI Ranking** on, and watch:
 
 ## AWS deployment
 
-The `Dockerfile` includes the Lambda Web Adapter sidecar:
+The `Dockerfile` includes the Lambda Web Adapter sidecar (v1.0.1):
 
 ```dockerfile
-COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4 \
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.0.1 \
      /lambda-adapter /opt/extensions/lambda-adapter
 ENV AWS_LWA_INVOKE_MODE=response_stream
 ```
 
-This lets the function URL stream the SSE response directly to the caller without buffering. Wire it up with Terraform (see `../terraform/`) using a Lambda Function URL with `InvokeMode: RESPONSE_STREAM`.
+Deploy with OpenTofu from the `terraform/` folder inside this directory. The stack creates:
+- ECR repository (builds and pushes the Docker image locally)
+- Lambda function (Docker image, 1024 MB, 65 s timeout)
+- API Gateway REST with `response_transfer_mode = STREAM`
+
+```bash
+cd java-streaming/terraform
+tofu init
+tofu apply
+```
+
+### Key Lambda environment variables
+
+| Variable | Value | Why |
+|---|---|---|
+| `AWS_LWA_INVOKE_MODE` | `RESPONSE_STREAM` | Enables streaming through LWA |
+| `AWS_LWA_READINESS_CHECK_PATH` | `/healthz` | LWA polls this until Spring Boot is ready |
+| `AWS_LWA_ASYNC_INIT` | `true` | Prevents 10 s extension init timeout on cold start |
+| `PORT` | `8000` | Matches Spring Boot's listen port |
+
+### Test the deployed endpoint
+
+```bash
+# Flights only (30 s stream)
+curl -N \
+  -H "Accept: text/event-stream" \
+  "https://<api-id>.execute-api.us-east-1.amazonaws.com/dev/search/stream?ai=false&seed=42"
+
+# With AI ranking (~33 s stream)
+curl -N \
+  -H "Accept: text/event-stream" \
+  "https://<api-id>.execute-api.us-east-1.amazonaws.com/dev/search/stream?ai=true&seed=42"
+```
+
+### Debugging
+
+See `../../docs/lambda-streaming-debugging.md` (repo root) for:
+- How to invoke Lambda directly to isolate issues from API Gateway
+- The API Gateway streaming prelude schema and the Vary header trap
+- How to read the right CloudWatch log groups
